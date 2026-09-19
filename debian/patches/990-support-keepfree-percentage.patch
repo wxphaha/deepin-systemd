@@ -1,0 +1,223 @@
+Index: deepin-systemd/src/libsystemd/sd-journal/journal-file.c
+===================================================================
+--- deepin-systemd.orig/src/libsystemd/sd-journal/journal-file.c
++++ deepin-systemd/src/libsystemd/sd-journal/journal-file.c
+@@ -790,13 +790,13 @@ static int journal_file_allocate(JournalFile *f, uint64_t offset, uint64_t size)
+         if (JOURNAL_HEADER_COMPACT(f->header) && new_size > UINT32_MAX)
+                 return -E2BIG;
+ 
+-        if (new_size > f->metrics.min_size && f->metrics.keep_free > 0) {
++        if (new_size > f->metrics.min_size && f->metrics.keep_free.value > 0) {
+                 struct statvfs svfs;
+ 
+                 if (fstatvfs(f->fd, &svfs) >= 0) {
+                         uint64_t available;
+ 
+-                        available = LESS_BY(u64_multiply_safe(svfs.f_bfree, svfs.f_bsize), f->metrics.keep_free);
++                        available = LESS_BY(u64_multiply_safe(svfs.f_bfree, svfs.f_bsize), f->metrics.keep_free.value);
+ 
+                         if (new_size - old_size > available)
+                                 return -E2BIG;
+@@ -4037,12 +4037,20 @@ static void journal_default_metrics(JournalMetrics *m, int fd, bool compact) {
+                                     JOURNAL_FILE_SIZE_MIN,
+                                     m->max_size ?: UINT64_MAX);
+ 
+-        if (m->keep_free == UINT64_MAX) {
++        if (m->keep_free.scale > 0) {
++                /* Convert the configured fraction (e.g. SystemKeepFree=10%) into bytes.
++                 * Explicit user config is not subject to KEEP_FREE_UPPER. */
+                 if (fs_size > 0)
+-                        m->keep_free = MIN(PAGE_ALIGN_U64(fs_size / 20), /* 5% of file system size */
+-                                           KEEP_FREE_UPPER);
++                        m->keep_free.value = PAGE_ALIGN_U64(u64_multiply_safe(m->keep_free.value, fs_size) / m->keep_free.scale);
+                 else
+-                        m->keep_free = DEFAULT_KEEP_FREE;
++                        m->keep_free.value = DEFAULT_KEEP_FREE;
++                m->keep_free.scale = 0;
++        } else if (m->keep_free.value == UINT64_MAX) {
++                if (fs_size > 0)
++                        m->keep_free.value = MIN(PAGE_ALIGN_U64(fs_size / 20), /* 5% of file system size */
++                                                 KEEP_FREE_UPPER);
++                else
++                        m->keep_free.value = DEFAULT_KEEP_FREE;
+         }
+ 
+         if (m->n_max_files == UINT64_MAX)
+@@ -4053,7 +4061,7 @@ static void journal_default_metrics(JournalMetrics *m, int fd, bool compact) {
+                   FORMAT_BYTES(m->max_use),
+                   FORMAT_BYTES(m->max_size),
+                   FORMAT_BYTES(m->min_size),
+-                  FORMAT_BYTES(m->keep_free),
++                  FORMAT_BYTES(m->keep_free.value),
+                   m->n_max_files);
+ }
+ 
+@@ -4518,7 +4526,7 @@ void journal_reset_metrics(JournalMetrics *m) {
+                 .max_use = UINT64_MAX,
+                 .min_size = UINT64_MAX,
+                 .max_size = UINT64_MAX,
+-                .keep_free = UINT64_MAX,
++                .keep_free = { .value = UINT64_MAX },
+                 .n_max_files = UINT64_MAX,
+         };
+ }
+Index: deepin-systemd/src/libsystemd/sd-journal/journal-file.h
+===================================================================
+--- deepin-systemd.orig/src/libsystemd/sd-journal/journal-file.h
++++ deepin-systemd/src/libsystemd/sd-journal/journal-file.h
+@@ -19,13 +19,20 @@
+ #include "sparse-endian.h"
+ #include "time-util.h"
+ 
++typedef struct JournalKeepFree {
++        /* If scale == 0, use value as absolute bytes (UINT64_MAX = auto).
++         * Otherwise keep_free = fs_size * value / scale, e.g. scale=10000 → permyriad. */
++        uint64_t value;
++        uint64_t scale;
++} JournalKeepFree;
++
+ typedef struct JournalMetrics {
+         /* For all these: UINT64_MAX means "pick automatically", and 0 means "no limit enforced" */
+         uint64_t max_size;     /* how large journal files grow at max */
+         uint64_t min_size;     /* how large journal files grow at least */
+         uint64_t max_use;      /* how much disk space to use in total at max, keep_free permitting */
+         uint64_t min_use;      /* how much disk space to use in total at least, even if keep_free says not to */
+-        uint64_t keep_free;    /* how much to keep free on disk */
++        JournalKeepFree keep_free; /* how much to keep free on disk (absolute bytes or fraction of fs_size) */
+         uint64_t n_max_files;  /* how many files to keep around at max */
+ } JournalMetrics;
+ 
+Index: deepin-systemd/src/journal/journald-server.c
+===================================================================
+--- deepin-systemd.orig/src/journal/journald-server.c
++++ deepin-systemd/src/journal/journald-server.c
+@@ -45,6 +45,7 @@
+ #include "missing_audit.h"
+ #include "mkdir.h"
+ #include "parse-util.h"
++#include "percent-util.h"
+ #include "path-util.h"
+ #include "proc-cmdline.h"
+ #include "process-util.h"
+@@ -161,7 +162,7 @@ static int cache_space_refresh(Server *s, JournalStorage *storage) {
+         space->vfs_used = vfs_used;
+         space->vfs_available = vfs_avail;
+ 
+-        avail = LESS_BY(vfs_avail, metrics->keep_free);
++        avail = LESS_BY(vfs_avail, metrics->keep_free.value);
+ 
+         space->limit = CLAMP(vfs_used + avail, metrics->min_use, metrics->max_use);
+         space->available = LESS_BY(space->limit, vfs_used);
+@@ -229,8 +230,8 @@ void server_space_usage_message(Server *s, JournalStorage *storage) {
+                               "CURRENT_USE_PRETTY=%s", FORMAT_BYTES(storage->space.vfs_used),
+                               "MAX_USE=%"PRIu64, metrics->max_use,
+                               "MAX_USE_PRETTY=%s", FORMAT_BYTES(metrics->max_use),
+-                              "DISK_KEEP_FREE=%"PRIu64, metrics->keep_free,
+-                              "DISK_KEEP_FREE_PRETTY=%s", FORMAT_BYTES(metrics->keep_free),
++                              "DISK_KEEP_FREE=%"PRIu64, metrics->keep_free.value,
++                              "DISK_KEEP_FREE_PRETTY=%s", FORMAT_BYTES(metrics->keep_free.value),
+                               "DISK_AVAILABLE=%"PRIu64, storage->space.vfs_available,
+                               "DISK_AVAILABLE_PRETTY=%s", FORMAT_BYTES(storage->space.vfs_available),
+                               "LIMIT=%"PRIu64, storage->space.limit,
+@@ -1846,6 +1847,41 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
+         return 0;
+ }
+ 
++int config_parse_journal_keep_free(
++                const char *unit,
++                const char *filename,
++                unsigned line,
++                const char *section,
++                unsigned section_line,
++                const char *lvalue,
++                int ltype,
++                const char *rvalue,
++                void *data,
++                void *userdata) {
++
++        JournalKeepFree *kf = data;
++        uint64_t v;
++        int r;
++
++        if (isempty(rvalue))
++                return 0;
++
++        r = parse_permyriad(rvalue);
++        if (r >= 0) {
++                kf->value = r;
++                kf->scale = 10000;
++                return 0;
++        }
++
++        r = parse_size(rvalue, 1024, &v);
++        if (r < 0)
++                return log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse keep free value '%s', ignoring: %m", rvalue);
++
++        kf->value = v;
++        kf->scale = 0;
++        return 0;
++}
++
+ static int server_parse_config_file(Server *s) {
+         const char *conf_file = "journald.conf";
+ 
+Index: deepin-systemd/src/journal/journald-server.h
+===================================================================
+--- deepin-systemd.orig/src/journal/journald-server.h
++++ deepin-systemd/src/journal/journald-server.h
+@@ -219,6 +219,7 @@ const char *storage_to_string(Storage s) _const_;
+ Storage storage_from_string(const char *s) _pure_;
+ 
+ CONFIG_PARSER_PROTOTYPE(config_parse_split_mode);
++CONFIG_PARSER_PROTOTYPE(config_parse_journal_keep_free);
+ 
+ const char *split_mode_to_string(SplitMode s) _const_;
+ SplitMode split_mode_from_string(const char *s) _pure_;
+Index: deepin-systemd/src/journal/journald-gperf.gperf
+===================================================================
+--- deepin-systemd.orig/src/journal/journald-gperf.gperf
++++ deepin-systemd/src/journal/journald-gperf.gperf
+@@ -31,11 +31,11 @@ Journal.RateLimitIntervalSec,config_parse_sec,       0, offsetof(Server, ratelim
+ Journal.RateLimitBurst,     config_parse_unsigned,   0, offsetof(Server, ratelimit_burst)
+ Journal.SystemMaxUse,       config_parse_iec_uint64, 0, offsetof(Server, system_storage.metrics.max_use)
+ Journal.SystemMaxFileSize,  config_parse_iec_uint64, 0, offsetof(Server, system_storage.metrics.max_size)
+-Journal.SystemKeepFree,     config_parse_iec_uint64, 0, offsetof(Server, system_storage.metrics.keep_free)
++Journal.SystemKeepFree,     config_parse_journal_keep_free, 0, offsetof(Server, system_storage.metrics.keep_free)
+ Journal.SystemMaxFiles,     config_parse_uint64,     0, offsetof(Server, system_storage.metrics.n_max_files)
+ Journal.RuntimeMaxUse,      config_parse_iec_uint64, 0, offsetof(Server, runtime_storage.metrics.max_use)
+ Journal.RuntimeMaxFileSize, config_parse_iec_uint64, 0, offsetof(Server, runtime_storage.metrics.max_size)
+-Journal.RuntimeKeepFree,    config_parse_iec_uint64, 0, offsetof(Server, runtime_storage.metrics.keep_free)
++Journal.RuntimeKeepFree,    config_parse_journal_keep_free, 0, offsetof(Server, runtime_storage.metrics.keep_free)
+ Journal.RuntimeMaxFiles,    config_parse_uint64,     0, offsetof(Server, runtime_storage.metrics.n_max_files)
+ Journal.MaxRetentionSec,    config_parse_sec,        0, offsetof(Server, max_retention_usec)
+ Journal.MaxFileSec,         config_parse_sec,        0, offsetof(Server, max_file_usec)
+Index: deepin-systemd/src/journal-remote/journal-remote-main.c
+===================================================================
+--- deepin-systemd.orig/src/journal-remote/journal-remote-main.c
++++ deepin-systemd/src/journal-remote/journal-remote-main.c
+@@ -1118,7 +1118,7 @@ static int run(int argc, char **argv) {
+         journal_reset_metrics(&s.metrics);
+         s.metrics.max_use = arg_max_use;
+         s.metrics.max_size = arg_max_size;
+-        s.metrics.keep_free = arg_keep_free;
++        s.metrics.keep_free = (JournalKeepFree) { .value = arg_keep_free };
+         s.metrics.n_max_files = arg_n_max_files;
+ 
+         r = create_remoteserver(&s, key, cert, trust);
+Index: deepin-systemd/man/journald.conf.xml
+===================================================================
+--- deepin-systemd.orig/man/journald.conf.xml
++++ deepin-systemd/man/journald.conf.xml
+@@ -263,7 +263,11 @@
+         <varname>RuntimeKeepFree=</varname> control how much disk
+         space systemd-journald shall leave free for other uses.
+         <command>systemd-journald</command> will respect both limits
+-        and use the smaller of the two values.</para>
++        and use the smaller of the two values. These two settings
++        accept a size in bytes (optionally suffixed with K, M, G, T,
++        P, E) or a percentage of the size of the respective file
++        system, specified as a value suffixed with <literal>%</literal>
++        (e.g. <literal>10%</literal>).</para>
+ 
+         <para>The first pair defaults to 10% and the second to 15% of
+         the size of the respective file system, but each value is
