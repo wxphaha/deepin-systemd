@@ -1,3 +1,33 @@
+systemd (255.2-4deepin80) unstable; urgency=medium
+
+  * journal: support percentage values for SystemKeepFree= and
+    RuntimeKeepFree= (e.g. "SystemKeepFree=21%"), so that a configurable
+    fraction of the file system can be kept free regardless of disk size
+    or reserved space. Absolute byte sizes remain supported; the default
+    (5%) and journal-remote are unaffected.
+  * journal: on the first vacuum after a restart, drop the vacuum limit
+    by one journal file when the free space is below keep_free, so that
+    the usage settles back at the level it had before the restart
+    instead of ratcheting up on every restart.
+  * journal: address review findings for the percentage support - a
+    malformed value is logged and ignored instead of aborting the rest
+    of journald.conf; the percentage and absolute byte fields are kept
+    strictly mutually exclusive so a reload that does not reopen the
+    journal files cannot disable the limit; the percentage-to-bytes
+    conversion falls back to the default on overflow; man page wording
+    no longer ties the feature to the ext4 root reservation.
+  * journal: do not re-anchor the vacuum limit to the current usage while
+    the df-visible free space is below keep_free: the freshly computed
+    limit may already contain the not yet vacuumed growth (the journal
+    file rotated in right before the vacuum and the writes that filled
+    the previous one), which made the following vacuum a no-op and let
+    the journal usage creep up one file per rotation until the kept free
+    space was broken. Keep the previously established limit instead (it
+    may still decrease, but never increase), so the vacuum trims the
+    growth back to it.
+
+ -- wangxinpeng <wangxinpeng@uniontech.com>  Fri, 25 Sep 2026 15:10:00 +0800
+
 systemd (255.2-4deepin79) unstable; urgency=medium
 
   * not-installed: add systemd-pcrphase-factory-reset.service and its

@@ -1,0 +1,39 @@
+Index: deepin-systemd/src/journal/journald-server.c
+===================================================================
+--- deepin-systemd.orig/src/journal/journald-server.c
++++ deepin-systemd/src/journal/journald-server.c
+@@ -753,6 +753,7 @@ void server_sync(Server *s) {
+ 
+ static void server_do_vacuum(Server *s, JournalStorage *storage, bool verbose) {
+ 
++        static bool first_vacuum = true;         /* 进程级：每次 journald 启动自动重置 */
+         int r;
+ 
+         assert(s);
+@@ -760,6 +761,26 @@ static void server_do_vacuum(Server *s,
+ 
+         (void) cache_space_refresh(s, storage);
+ 
++        if (first_vacuum) {
++                first_vacuum = false;
++
++                /* patch_min_use() 把 min_use（进而 limit）锚定在重启瞬间的
++                 * journal 用量。重启若发生在夹心区（磁盘剩余 < keep_free）
++                 * 且正值高速写入，该锚点比重启前稳态高约一个 journal 文件
++                 * 档；而真空从不删到 min_use 以下，于是每次重启水位抬升一
++                 * 档，长期反复重启会累积突破 keep_free。仅此一次：把删除
++                 * 目标与 min_use 下限同时下调一个文件档（metrics.max_size，
++                 * 配置推导值），使水位回到重启前的稳态线。 */
++                if (storage->space.vfs_available <
++                            journal_effective_keep_free(&storage->metrics,
++                                                        storage->space.fs_size) &&
++                    storage->space.limit > storage->metrics.max_size) {
++                        storage->space.limit -= storage->metrics.max_size;
++                        storage->metrics.min_use = MIN(storage->metrics.min_use,
++                                                       storage->space.limit);
++                }
++        }
++
+         if (verbose)
+                 server_space_usage_message(s, storage);
+ 
